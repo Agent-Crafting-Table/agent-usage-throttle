@@ -1,0 +1,40 @@
+[
+  {
+    "_comment": "Refresh usage stats every 30 minutes (shell runner — no model needed)",
+    "id": "usage-stats",
+    "name": "Claude Usage Stats",
+    "enabled": true,
+    "schedule": "*/30 * * * *",
+    "runner": "shell",
+    "shellCommand": "node /workspace/scripts/usage-stats.js"
+  },
+  {
+    "_comment": "Check thresholds hourly and set/clear throttle files",
+    "id": "usage-throttle",
+    "name": "Usage Throttle Check",
+    "enabled": true,
+    "schedule": "5 * * * *",
+    "runner": "shell",
+    "shellCommand": "node /workspace/scripts/usage-throttle.js"
+  },
+  {
+    "_comment": "Heavy agent — paused at soft AND hard throttle (default tier=soft)",
+    "id": "my-developer-agent",
+    "name": "Developer Agent",
+    "enabled": true,
+    "schedule": "0,30 * * * *",
+    "preCommand": "/workspace/scripts/preflight-gate.sh --tier soft",
+    "timeoutSeconds": 600,
+    "message": "You are the Developer. Check the backlog for ready tasks, implement the next one, open a PR. Reply HEARTBEAT_OK when done."
+  },
+  {
+    "_comment": "Light agent — only paused at hard throttle (tier=hard)",
+    "id": "my-reviewer-agent",
+    "name": "Reviewer Agent",
+    "enabled": true,
+    "schedule": "15,45 * * * *",
+    "preCommand": "/workspace/scripts/preflight-gate.sh --tier hard",
+    "timeoutSeconds": 600,
+    "message": "You are the Reviewer. Check open PRs for review. Reply HEARTBEAT_OK when done."
+  }
+]
