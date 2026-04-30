@@ -4,6 +4,76 @@ Automatically pauses your Claude Code agent pipeline when weekly token usage get
 
 > Part of [The Agent Crafting Table](https://github.com/Agent-Crafting-Table) — standalone Claude Code agent components.
 
+## How It Works
+
+```mermaid
+flowchart TD
+    A["usage-stats.js
+every 30 min"] --> B["Scan ~/.claude/projects/**/*.jsonl
+collect all session token data"]
+    B --> C[Sum tokens per day + week
+since last Thursday 2am UTC reset]
+    C --> D[Compute estimatedCostUSD
+using model-weighted pricing
+Opus ~5x Sonnet]
+    D --> E[Write data/claude-usage-cache.json]
+
+    E --> F["usage-throttle.js
+every hour"]
+    F --> G[Read weekTotal.estimatedCostUSD]
+    G --> H{Compare to WEEKLY_USD_BUDGET}
+
+    H -->|< 70%| I[No throttle files
+all agents run normally]
+    H -->|>= 70%| J[Write THROTTLE_SOFT
+post Discord alert on state change]
+    H -->|>= 90%| K[Write THROTTLE_HARD
+post Discord alert on state change]
+    H -->|"< 65% (hysteresis)"| L[Remove THROTTLE_SOFT]
+    H -->|"< 85% (hysteresis)"| M[Remove THROTTLE_HARD]
+
+    subgraph "preflight-gate.sh (before each agent spawn)"
+        N["preCommand in crons/jobs.json"] --> O{Check throttle tier}
+        O -->|"--tier soft: THROTTLE_SOFT exists"| P[exit 1 — skip this tick]
+        O -->|"--tier hard: THROTTLE_HARD exists"| P
+        O -->|"no matching throttle file"| Q[exit 0 — spawn agent]
+    end
+```
+
+```mermaid
+flowchart LR
+    subgraph "Two-Tier Assignment"
+        SOFT["--tier soft
+Write-heavy agents
+Developer, PM, Auditor
+(create new work)"]
+        HARD["--tier hard
+Light drain agents
+Reviewer, Merge Watcher
+(clear existing queue)"]
+    end
+
+    subgraph "Throttle State"
+        T0["0-70%: normal
+both tiers run"]
+        T1["70-90%: SOFT active
+soft agents paused
+hard agents still run"]
+        T2["90%+: HARD active
+all agents paused"]
+        T0 --> T1
+        T1 --> T2
+        T2 -->|"Thu 2am UTC reset"| T0
+    end
+
+    subgraph "Hysteresis (prevents flapping)"
+        H1["SOFT clears at 65%
+(not 70%)"]
+        H2["HARD clears at 85%
+(not 90%)"]
+    end
+```
+
 ## Drop-in
 
 ```bash
@@ -40,28 +110,6 @@ This system gives you a graceful two-tier ramp-down:
 
 1. **Soft (70%)** — pause write-heavy agents (Developer, PM, Auditor). Reviewers and merge watchers keep draining the existing queue
 2. **Hard (90%)** — pause everything. Pipeline resumes automatically after the weekly reset (Thursday 2:00 AM UTC on Max plans)
-
-## How It Works
-
-```
-usage-stats.js (every 30 min)
-  → scans ~/.claude/projects/**/*.jsonl
-  → sums tokens per day + per week (since last Thu 2am reset)
-  → computes estimatedCostUSD per day using model-weighted API pricing
-  → writes data/claude-usage-cache.json
-
-usage-throttle.js (every hour)
-  → reads weekTotal.estimatedCostUSD from cache
-  → compares to WEEKLY_USD_BUDGET (default $1700)
-  → writes/removes data/runtime/THROTTLE_SOFT and THROTTLE_HARD
-  → posts Discord alert on state change (optional)
-
-preflight-gate.sh (before each agent spawn, via preCommand)
-  → exit 0 → cron-runner spawns the agent
-  → exit 1 → cron-runner skips this tick silently
-```
-
-The `estimatedCostUSD` metric uses per-turn model pricing (Opus/Sonnet/Haiku rates), so it weights Opus turns 5× higher than Sonnet — closely tracking Anthropic's internal "All models" usage percentage on Max plans.
 
 ## Two Tiers in Practice
 
@@ -126,8 +174,6 @@ To calibrate for any plan:
 1. Note the % shown on claude.ai → Settings → Usage
 2. Run `node scripts/usage-stats.js` and read `weekTotal.estimatedCostUSD`
 3. `WEEKLY_USD_BUDGET = estimatedCostUSD / (claude_pct / 100)`
-
-Recheck after a week if your model mix shifts — the ratio is stable within a plan tier but varies if you go heavy on Opus vs Sonnet.
 
 ## Example Output
 
