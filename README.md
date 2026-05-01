@@ -1,6 +1,6 @@
-# agent-usage-throttle — Two-Tier Token Budget Throttle for Claude Code Pipelines
+# agent-usage-throttle — Graduated Token Budget Throttle for Claude Code Pipelines
 
-Automatically pauses your Claude Code agent pipeline when weekly token usage gets high — soft pause for write-heavy agents at 70%, hard block for everything at 90%. Uses model-weighted estimated cost (Opus ≈ 5× Sonnet) as the metric so the numbers actually track what Anthropic measures.
+Auto-paces your Claude Code agent pipeline against a weekly token budget. Four graduated zones (Sprint / Cruise / Conservation / Minimal) progressively slow agents as you approach the limit, with end-of-week burn / floor logic so you don't waste headroom or hit a cliff. Uses model-weighted estimated cost (Opus ≈ 5× Sonnet) so the numbers actually track what Anthropic measures.
 
 > Part of [The Agent Crafting Table](https://github.com/Agent-Crafting-Table) — standalone Claude Code agent components.
 
@@ -9,70 +9,70 @@ Automatically pauses your Claude Code agent pipeline when weekly token usage get
 ```mermaid
 flowchart TD
     A["usage-stats.js
-every 30 min"] --> B["Scan ~/.claude/projects/**/*.jsonl
-collect all session token data"]
+every 30 min"] --> B["Scan ~/.claude/projects/**/*.jsonl"]
     B --> C[Sum tokens per day + week
-since last Thursday 2am UTC reset]
+since last reset]
     C --> D[Compute estimatedCostUSD
-using model-weighted pricing
-Opus ~5x Sonnet]
+model-weighted Opus ~5x Sonnet]
     D --> E[Write data/claude-usage-cache.json]
 
     E --> F["usage-throttle.js
-every hour"]
-    F --> G[Read weekTotal.estimatedCostUSD]
-    G --> H{Compare to WEEKLY_USD_BUDGET}
+every 30 min"]
+    F --> G[Compute pct = used / budget]
+    G --> H{Pick zone}
+    H -->|0–30%| Z1[🚀 Sprint]
+    H -->|30–65%| Z2[✈️ Cruise]
+    H -->|65–85%| Z3[🐢 Conservation]
+    H -->|85%+| Z4[🔴 Minimal]
 
-    H -->|< 70%| I[No throttle files
-all agents run normally]
-    H -->|>= 70%| J[Write THROTTLE_SOFT
-post Discord alert on state change]
-    H -->|>= 90%| K[Write THROTTLE_HARD
-post Discord alert on state change]
-    H -->|"< 65% (hysteresis)"| L[Remove THROTTLE_SOFT]
-    H -->|"< 85% (hysteresis)"| M[Remove THROTTLE_HARD]
+    Z1 --> WRITE
+    Z2 --> WRITE
+    Z3 --> WRITE
+    Z4 --> WRITE
 
-    subgraph "preflight-gate.sh (before each agent spawn)"
-        N["preCommand in crons/jobs.json"] --> O{Check throttle tier}
-        O -->|"--tier soft: THROTTLE_SOFT exists"| P[exit 1 — skip this tick]
-        O -->|"--tier hard: THROTTLE_HARD exists"| P
-        O -->|"no matching throttle file"| Q[exit 0 — spawn agent]
+    WRITE[Write per-agent THROTTLE_INTERVAL_AGENT files
+and legacy THROTTLE_SOFT/HARD]
+
+    WRITE --> EOW{End-of-week overrides}
+    EOW -->|"48–24h pre-reset, pct < 65%"| FLOOR[Floor to Cruise
+don't waste budget]
+    EOW -->|"final 24h, leftover/hr > 1%"| BURN[Force Sprint
+burn the rest]
+    EOW -->|"FAST_MODE file present"| FAST[Force Sprint always]
+
+    subgraph "preflight-gate.sh"
+        N["preCommand in jobs.json"] --> O{Hard active?}
+        O -->|yes| SKIP[exit 1]
+        O -->|no| O2{Soft active + tier=soft?}
+        O2 -->|yes| SKIP
+        O2 -->|no| O3{"INTERVAL_AGENT exists
++ last run too recent?"}
+        O3 -->|yes| SKIP
+        O3 -->|no| ALLOW[exit 0 — spawn]
     end
 ```
 
-```mermaid
-flowchart LR
-    subgraph "Two-Tier Assignment"
-        SOFT["--tier soft
-Write-heavy agents
-Developer, PM, Auditor
-(create new work)"]
-        HARD["--tier hard
-Light drain agents
-Reviewer, Merge Watcher
-(clear existing queue)"]
-    end
+## Four Zones
 
-    subgraph "Throttle State"
-        T0["0-70%: normal
-both tiers run"]
-        T1["70-90%: SOFT active
-soft agents paused
-hard agents still run"]
-        T2["90%+: HARD active
-all agents paused"]
-        T0 --> T1
-        T1 --> T2
-        T2 -->|"Thu 2am UTC reset"| T0
-    end
+| Zone | Range | Behavior |
+|---|---|---|
+| 🚀 **Sprint** | 0–30% | Full speed. No per-agent throttle. |
+| ✈️ **Cruise** | 30–65% | Developer / Reviewer 25 min, TRD Watcher / Merge Watcher 15 min, CI fixers 5 min, PM 30 min, others normal. |
+| 🐢 **Conservation** | 65–85% | Developer 45 min, Reviewer 60 min, CI fixers 15–30 min, PM 2h, others 6h. Also writes legacy `THROTTLE_SOFT`. |
+| 🔴 **Minimal** | 85%+ | Most agents 3h, PM / PdM / Auditor 6h+. Also writes legacy `THROTTLE_HARD`. |
 
-    subgraph "Hysteresis (prevents flapping)"
-        H1["SOFT clears at 65%
-(not 70%)"]
-        H2["HARD clears at 85%
-(not 90%)"]
-    end
-```
+Boundaries have a 2-percentage-point hysteresis on the way down to prevent flapping.
+
+## End-of-Week Logic
+
+Weekly budgets reset on a known schedule (Anthropic Max default: Thursday 2:00 AM UTC, configurable via `USAGE_RESET_DAY` / `USAGE_RESET_HOUR`). The throttle reads `nextResetAt` from the cache and applies two overrides near the boundary:
+
+- **48–24h pre-reset, if pct < 65%** → floor to Cruise. Stops you from under-spending budget you've already paid for.
+- **Final 24h, if `leftover% / hours-left > 1%/h`** → force Sprint. Burns the remaining budget on real work instead of leaving it on the floor at the rollover.
+
+## FAST_MODE Override
+
+`touch $THROTTLE_RUNTIME_DIR/FAST_MODE` to force Sprint zone regardless of usage and end-of-week state. Useful when you want to push through a refactor or unblock a stalled review session. Delete the file to restore normal zone selection.
 
 ## Drop-in
 
@@ -88,57 +88,53 @@ Add to your `crons/jobs.json` (see `examples/jobs.json` for full entries):
 ```json
 { "id": "usage-stats",    "schedule": "*/30 * * * *", "runner": "shell",
   "shellCommand": "node /workspace/scripts/usage-stats.js" },
-{ "id": "usage-throttle", "schedule": "5 * * * *",    "runner": "shell",
+{ "id": "usage-throttle", "schedule": "5,35 * * * *", "runner": "shell",
   "shellCommand": "node /workspace/scripts/usage-throttle.js" }
 ```
 
-Add `preCommand` to any agent job you want gated:
+For each agent job, add a `preCommand` that gates spawns. Pass `--agent <name>` to enable graduated zone throttling (Cruise+); without it, only the legacy soft/hard pause behavior applies.
 
 ```json
-"preCommand": "/workspace/scripts/preflight-gate.sh --tier soft"
+"preCommand": "/workspace/scripts/preflight-gate.sh --tier soft --agent developer --log /workspace/agent-log.md"
 ```
+
+## Back-Compat with the 2-Tier API
+
+This release supersedes the original two-tier soft/hard throttle but keeps full back-compat. Whenever the zone is **Conservation or higher**, `THROTTLE_SOFT` is written. Whenever the zone is **Minimal**, `THROTTLE_HARD` is written. Existing preflight gates that only check those two files keep working unchanged. The new graduated behavior only kicks in when you pass `--agent` to the gate.
 
 ## Why
 
-Autonomous agent pipelines burn tokens fast — especially when multiple agents run in parallel and Opus handles the heavy lifting. Without a budget gate:
+Autonomous agent pipelines burn tokens fast — especially when multiple agents run in parallel and Opus handles the heavy lifting. A binary on/off throttle either pauses too late (everything stops mid-task at 90%) or too early (the whole pipeline freezes at 70% with the rest of the budget unused). A 4-zone graduated approach:
 
-- The pipeline runs at full speed until the weekly limit hits, then **everything stops cold** mid-task
-- You have no visibility into how close you are until it's too late
-- Anthropic measures usage as a model-weighted composite (Opus costs ~5× Sonnet), so naive output-token counting will read 25% while the real number is 68%
+1. Slows agents progressively as you approach the cap rather than cliff-pausing.
+2. Doesn't waste end-of-week headroom — the EOW floor keeps you in Cruise even on slack weeks.
+3. Burns leftover budget at the end of the cycle if there's enough headroom, instead of letting it expire at reset.
+4. Gives a manual escape hatch (`FAST_MODE`) for "just push through this" sessions.
 
-This system gives you a graceful two-tier ramp-down:
-
-1. **Soft (70%)** — pause write-heavy agents (Developer, PM, Auditor). Reviewers and merge watchers keep draining the existing queue
-2. **Hard (90%)** — pause everything. Pipeline resumes automatically after the weekly reset (Thursday 2:00 AM UTC on Max plans)
-
-## Two Tiers in Practice
-
-| Tier | Threshold | Clears at | Blocks |
-|------|-----------|-----------|--------|
-| Soft | 70% | 65% | Agents you mark `--tier soft` in preCommand |
-| Hard | 90% | 85% | All agents (hard also implies soft) |
-
-**Hysteresis** (the 5% gap between set and clear) prevents flapping when usage sits right at the boundary.
-
-Assign tiers by agent role:
-- `--tier soft` — write-heavy agents that create new work (Developer, PM, Auditor)
-- `--tier hard` — light agents that drain existing work (Reviewer, Merge Watcher)
+Anthropic measures usage as a model-weighted composite (Opus costs ~5× Sonnet), so naive output-token counting will read 25% while the real number is 68%. `usage-stats.js` does the model weighting for you.
 
 ## Configuration
 
 All settings via environment variables or `.env` file in `WORKSPACE_DIR`:
 
-**Throttle thresholds (`usage-throttle.js`)**
+**Throttle (`usage-throttle.js`)**
 
 | Variable | Default | Description |
 |---|---|---|
 | `WEEKLY_USD_BUDGET` | `1700` | Budget ceiling in estimated USD cost units |
-| `THROTTLE_SOFT_PCT` | `70` | Soft pause threshold (%) |
-| `THROTTLE_HARD_PCT` | `90` | Hard pause threshold (%) |
-| `THROTTLE_RUNTIME_DIR` | `data/runtime` | Where THROTTLE_SOFT / THROTTLE_HARD files live |
+| `THROTTLE_RUNTIME_DIR` | `data/runtime` | Where ZONE / THROTTLE_INTERVAL_* / THROTTLE_SOFT / THROTTLE_HARD / FAST_MODE live |
 | `USAGE_CACHE_FILE` | `data/claude-usage-cache.json` | Cache generated by usage-stats.js |
-| `DISCORD_POST_SCRIPT` | — | `node <path> <channel_id> <message>` helper for alerts |
-| `DISCORD_CHANNEL_ID` | — | Channel to post soft/hard transition alerts |
+| `THROTTLE_AGENT_NAMES` | (developer, reviewer, trd_watcher, merge_watcher, pr_ci_fixer, main_ci_fixer, project_manager, product_manager, codebase_auditor) | Comma-separated agent names for which to write `THROTTLE_INTERVAL_<AGENT>` files |
+| `DISCORD_POST_SCRIPT` | — | `node <path> <channel_id> <message>` helper for zone-transition alerts |
+| `DISCORD_CHANNEL_ID` | — | Channel to post zone-transition alerts |
+
+**Preflight gate (`preflight-gate.sh`)**
+
+| Flag / Env | Default | Description |
+|---|---|---|
+| `--tier soft\|hard` | `soft` | Block on legacy SOFT/HARD files. `soft` blocks at Conservation+, `hard` only at Minimal. |
+| `--agent <name>` | — | Snake_case agent name. Enables zone-throttle skip via `THROTTLE_INTERVAL_<AGENT>`. |
+| `--log <path>` | `$WORKSPACE_DIR/agent-log.md` | Path to a log file with ISO-8601 timestamps + agent names; used to compute "minutes since last run". |
 
 **Reset schedule + scanning (`usage-stats.js`)**
 
@@ -178,17 +174,19 @@ To calibrate for any plan:
 ## Example Output
 
 ```
-# usage-stats.js
-Scanning 312 JSONL files from last 14 days...
-Written: data/claude-usage-cache.json
-Week total: $1563 est. cost, 20.6M output tokens
+# usage-throttle.js (every 30 min)
+[usage-throttle] $1145 / $1700 (67.4%) zone=conservation hrs_to_reset=42.3
+[usage-throttle] $1623 / $1700 (95.5%) zone=minimal hrs_to_reset=12.5
+[usage-throttle] $1480 / $1700 (87.1%) zone=sprint mode=eow-burn hrs_to_reset=8.0
+[usage-throttle] $480 / $1700 (28.2%) zone=cruise mode=eow-floor hrs_to_reset=36.0
 
-# usage-throttle.js
-[usage-throttle] $1563 / $1700 est. weekly cost (91.9%) — soft=true hard=true
+# Audit trail at runtime/throttle-history.jsonl
+{"ts":"2026-05-01T07:35:00Z","zone":"cruise","pct":42.3,"mode":null}
+{"ts":"2026-05-01T08:05:00Z","zone":"conservation","pct":67.4,"mode":null}
 
 # preflight-gate.sh (from cron-runner logs)
-[cron] gl-developer preCommand exited 1 — skipping tick
-[cron] gl-reviewer  preCommand exited 0 — spawning agent
+[cron] developer  preCommand exited 1 — skipping tick (interval 25min, ran 12min ago)
+[cron] reviewer   preCommand exited 0 — spawning agent
 ```
 
 ## Requirements

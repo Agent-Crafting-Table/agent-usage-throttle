@@ -9,31 +9,31 @@
     "shellCommand": "node /workspace/scripts/usage-stats.js"
   },
   {
-    "_comment": "Check thresholds hourly and set/clear throttle files",
+    "_comment": "Recompute current zone every 30 minutes — fast pickup of EOW transitions",
     "id": "usage-throttle",
     "name": "Usage Throttle Check",
     "enabled": true,
-    "schedule": "5 * * * *",
+    "schedule": "5,35 * * * *",
     "runner": "shell",
     "shellCommand": "node /workspace/scripts/usage-throttle.js"
   },
   {
-    "_comment": "Heavy agent — paused at soft AND hard throttle (default tier=soft)",
+    "_comment": "Heavy agent — graduated zone throttle via --agent. Cruise: 25min, Conservation: 45min, Minimal: 3h. Pass --log so the gate can compute time-since-last-run.",
     "id": "my-developer-agent",
     "name": "Developer Agent",
     "enabled": true,
-    "schedule": "0,30 * * * *",
-    "preCommand": "/workspace/scripts/preflight-gate.sh --tier soft",
+    "schedule": "0,5,10,15,20,25,30,35,40,45,50,55 * * * *",
+    "preCommand": "/workspace/scripts/preflight-gate.sh --tier soft --agent developer --log /workspace/agent-log.md",
     "timeoutSeconds": 600,
     "message": "You are the Developer. Check the backlog for ready tasks, implement the next one, open a PR. Reply HEARTBEAT_OK when done."
   },
   {
-    "_comment": "Light agent — only paused at hard throttle (tier=hard)",
+    "_comment": "Light drain agent — only paused at Minimal zone (tier=hard). No graduated throttle.",
     "id": "my-reviewer-agent",
     "name": "Reviewer Agent",
     "enabled": true,
-    "schedule": "15,45 * * * *",
-    "preCommand": "/workspace/scripts/preflight-gate.sh --tier hard",
+    "schedule": "5,15,25,35,45,55 * * * *",
+    "preCommand": "/workspace/scripts/preflight-gate.sh --tier hard --agent reviewer --log /workspace/agent-log.md",
     "timeoutSeconds": 600,
     "message": "You are the Reviewer. Check open PRs for review. Reply HEARTBEAT_OK when done."
   }
